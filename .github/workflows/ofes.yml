@@ -21,6 +21,9 @@ on:
       jitter_ms:
         description: "jitter ms"
         default: "10"
+      backfill:
+        description: "1 = re-queue every id not in xlsx (ignores hits.txt)"
+        default: "0"
   push:
     branches: [main]
     paths:
@@ -437,6 +440,10 @@ jobs:
                   sid = str(row.get("student_id","") or "").strip()
                   pwd = str(row.get("password","") or "").strip()
                   with self.lock:
+                      if sid and sid in self.seen_ids:
+                          _dup_count += 1
+                          log("dim", f"[=] dup id={sid}")
+                          return False
                       if sid and pwd and (sid, pwd) in self.seen_pairs:
                           _dup_count += 1
                           log("dim", f"[=] dup pair id={sid} pwd={pwd}")
@@ -509,8 +516,6 @@ jobs:
                           os.fsync(self.fh.fileno())
                       except OSError:
                           pass
-                  if self.commit:
-                      git_commit_push(f"ofes: hit {line.split(':',1)[0]}")
 
               def close(self):
                   with self.lock:
@@ -562,32 +567,13 @@ jobs:
               return [f"{year}-{i:0{width}d}" for i in range(lo, hi+1)]
 
 
-          def load_existing(path):
-              seen = set()
-              try:
-                  with open(path) as fh:
-                      for line in fh:
-                          line = line.strip()
-                          if not line:
-                              continue
-                          if " = captured" in line:
-                              seen.add(line.split(":",1)[0].strip())
-                          elif "|" in line:
-                              seen.add(line.split("|",1)[0].strip())
-              except FileNotFoundError:
-                  pass
-              return seen
-
-
-          def run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape):
+          def run_year(year_str, lo, hi, workers, delay_ms, backfill, auto_scrape):
               all_ids = id_range(year_str, lo, hi)
-              log("cyan", f"[*] year {year_str}: {lo}..{hi}  ({len(all_ids):,} ids)")
-              if resume:
-                  seen = load_existing(RESULTS)
-                  seen |= get_store().seen_ids
-                  before = len(all_ids)
-                  all_ids = [i for i in all_ids if i not in seen]
-                  log("cyan", f"[*] resume: {len(all_ids):,}/{before:,} remaining")
+              before = len(all_ids)
+              done = get_store().seen_ids
+              all_ids = [i for i in all_ids if i not in done]
+              log("cyan", f"[*] year {year_str}: {lo}..{hi}  queued {len(all_ids):,}/{before:,} "
+                          f"(skip={before-len(all_ids):,} already in xlsx)")
               if not all_ids:
                   log("cyan", "[*] nothing to do")
                   return
@@ -595,7 +581,7 @@ jobs:
               for i in all_ids:
                   tq.put(i)
               pool = [build_session(pool_max=workers) for _ in range(workers)]
-              rlog = BufferedLogger(RESULTS, commit=True)
+              rlog = BufferedLogger(RESULTS, commit=False)
               elog = BufferedLogger(ERRORS,  commit=False)
               stop = threading.Event()
               threads = []
@@ -612,6 +598,7 @@ jobs:
                   rlog.close()
                   elog.close()
                   get_store().save()
+                  git_commit_push(f"ofes: end year {year_str}")
 
 
           def main():
@@ -621,14 +608,14 @@ jobs:
               hi          = int(os.environ.get("SUFFIX_END",  "99999"))
               workers     = int(os.environ.get("WORKERS",     "16"))
               delay_ms    = int(os.environ.get("JITTER_MS",   "10"))
-              resume      = os.environ.get("RESUME", "1") == "1"
+              backfill    = os.environ.get("BACKFILL", "0") == "1"
               auto_scrape = os.environ.get("AUTO_SCRAPE", "1") == "1"
 
               log("cyan", f"[*] years {year_start}..{year_end}")
               log("cyan", f"[*] first-year suffix {lo_first}..{hi}")
               log("cyan", f"[*] later-year suffix 1..{hi}")
-              log("cyan", f"[*] workers={workers} jitter={delay_ms}ms resume={resume} scrape={auto_scrape}")
-              log("cyan", "[*] commit mode: per-row realtime")
+              log("cyan", f"[*] workers={workers} jitter={delay_ms}ms backfill={backfill} scrape={auto_scrape}")
+              log("cyan", "[*] queue skip = id in xlsx only (hits.txt ignored)")
 
               t0 = time.time()
               for y in range(year_start, year_end + 1):
@@ -639,7 +626,7 @@ jobs:
                   log("cyan", f"[*] YEAR {year_str}  suffix {lo}..{hi}")
                   log("cyan", "=" * 60)
                   try:
-                      run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape)
+                      run_year(year_str, lo, hi, workers, delay_ms, backfill, auto_scrape)
                   except KeyboardInterrupt:
                       log("yellow", "[!] interrupted")
                       break
@@ -688,7 +675,7 @@ jobs:
           SUFFIX_END:    ${{ github.event.inputs.suffix_end   || '99999' }}
           WORKERS:       ${{ github.event.inputs.workers      || '16' }}
           JITTER_MS:     ${{ github.event.inputs.jitter_ms    || '10' }}
-          RESUME:        "1"
+          BACKFILL:      ${{ github.event.inputs.backfill     || '0' }}
           AUTO_SCRAPE:   "1"
           REPO_ROOT:     ${{ github.workspace }}
         run: python ofes_worker.py
