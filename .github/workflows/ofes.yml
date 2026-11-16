@@ -5,13 +5,13 @@ on:
     inputs:
       year_start:
         description: "start year (2-digit)"
-        default: "25"
+        default: "26"
       year_end:
         description: "end year (2-digit)"
         default: "26"
       suffix_start:
-        description: "suffix start (first year only)"
-        default: "9020"
+        description: "suffix start"
+        default: "6092"
       suffix_end:
         description: "suffix end"
         default: "99999"
@@ -602,9 +602,9 @@ jobs:
 
 
           def main():
-              year_start  = int(os.environ.get("YEAR_START",  "25"))
+              year_start  = int(os.environ.get("YEAR_START",  "26"))
               year_end    = int(os.environ.get("YEAR_END",    "26"))
-              lo_first    = int(os.environ.get("SUFFIX_START","9020"))
+              lo_first    = int(os.environ.get("SUFFIX_START","6092"))
               hi          = int(os.environ.get("SUFFIX_END",  "99999"))
               workers     = int(os.environ.get("WORKERS",     "16"))
               delay_ms    = int(os.environ.get("JITTER_MS",   "10"))
@@ -669,9 +669,9 @@ jobs:
 
       - name: Run harvester
         env:
-          YEAR_START:    ${{ github.event.inputs.year_start || '25' }}
+          YEAR_START:    ${{ github.event.inputs.year_start || '26' }}
           YEAR_END:      ${{ github.event.inputs.year_end   || '26' }}
-          SUFFIX_START:  ${{ github.event.inputs.suffix_start || '9020' }}
+          SUFFIX_START:  ${{ github.event.inputs.suffix_start || '6092' }}
           SUFFIX_END:    ${{ github.event.inputs.suffix_end   || '99999' }}
           WORKERS:       ${{ github.event.inputs.workers      || '16' }}
           JITTER_MS:     ${{ github.event.inputs.jitter_ms    || '10' }}
