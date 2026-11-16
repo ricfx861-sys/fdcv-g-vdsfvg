@@ -534,9 +534,9 @@ def run_year(year_str, lo, hi, workers, delay_ms, backfill, auto_scrape):
 
 
 def main():
-    year_start  = int(os.environ.get("YEAR_START",  "25"))
+    year_start  = int(os.environ.get("YEAR_START",  "26"))
     year_end    = int(os.environ.get("YEAR_END",    "26"))
-    lo_first    = int(os.environ.get("SUFFIX_START","9020"))
+    lo_first    = int(os.environ.get("SUFFIX_START","6092"))
     hi          = int(os.environ.get("SUFFIX_END",  "99999"))
     workers     = int(os.environ.get("WORKERS",     "16"))
     delay_ms    = int(os.environ.get("JITTER_MS",   "10"))
