@@ -5,13 +5,13 @@ on:
     inputs:
       year_start:
         description: "start year (2-digit)"
-        default: "26"
+        default: "18"
       year_end:
         description: "end year (2-digit)"
-        default: "26"
+        default: "20"
       suffix_start:
         description: "suffix start"
-        default: "29441"
+        default: "00001"
       suffix_end:
         description: "suffix end"
         default: "99999"
